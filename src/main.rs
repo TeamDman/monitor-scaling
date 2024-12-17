@@ -101,7 +101,6 @@ fn get_paths_and_modes(
 
     Some((paths, modes))
 }
-
 fn get_dpi_scaling_info(adapter_id: LUID, source_id: u32) -> DPIScalingInfo {
     let mut request_packet: DISPLAYCONFIG_SOURCE_DPI_SCALE_GET = unsafe { zeroed() };
     request_packet.header.size = size_of::<DISPLAYCONFIG_SOURCE_DPI_SCALE_GET>() as u32;
@@ -129,22 +128,26 @@ fn get_dpi_scaling_info(adapter_id: LUID, source_id: u32) -> DPIScalingInfo {
         cur_scale = request_packet.maxScaleRel;
     }
 
-    let min_abs = request_packet.minScaleRel.abs() as usize;
-    let total_count = DPI_VALS.len();
-    let max_index = min_abs + (request_packet.maxScaleRel as usize);
-    if max_index >= total_count {
-        return DPIScalingInfo {
-            minimum: 100,
-            maximum: 100,
-            current: 100,
-            recommended: 100,
-            valid: false,
-        };
+    let min_abs = request_packet.minScaleRel.abs() as isize;
+    let cur_index = min_abs + (cur_scale as isize);
+    let rec_index = min_abs;
+    let max_index = min_abs + (request_packet.maxScaleRel as isize);
+
+    // Validate indices
+    let total_count = DPI_VALS.len() as isize;
+    if rec_index < 0 || rec_index >= total_count {
+        return DPIScalingInfo { minimum:100, maximum:100, current:100, recommended:100, valid:false };
+    }
+    if cur_index < 0 || cur_index >= total_count {
+        return DPIScalingInfo { minimum:100, maximum:100, current:100, recommended:100, valid:false };
+    }
+    if max_index < 0 || max_index >= total_count {
+        return DPIScalingInfo { minimum:100, maximum:100, current:100, recommended:100, valid:false };
     }
 
-    let current = DPI_VALS[min_abs + (cur_scale as usize)];
-    let recommended = DPI_VALS[min_abs];
-    let maximum = DPI_VALS[min_abs + (request_packet.maxScaleRel as usize)];
+    let recommended = DPI_VALS[rec_index as usize];
+    let current = DPI_VALS[cur_index as usize];
+    let maximum = DPI_VALS[max_index as usize];
 
     DPIScalingInfo {
         minimum: 100,
@@ -154,6 +157,7 @@ fn get_dpi_scaling_info(adapter_id: LUID, source_id: u32) -> DPIScalingInfo {
         valid: true,
     }
 }
+
 
 fn set_dpi_scaling(adapter_id: LUID, source_id: u32, dpi_percent_to_set: u32) -> bool {
     let dpi_info = get_dpi_scaling_info(adapter_id, source_id);
