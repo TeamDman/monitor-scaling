@@ -1,13 +1,24 @@
-use std::io::{self, Write};
+use std::io::Write;
+use std::io::{self};
 use std::mem::size_of;
 use std::mem::zeroed;
-use windows::Win32::Devices::Display::{
-    DisplayConfigGetDeviceInfo, DisplayConfigSetDeviceInfo, GetDisplayConfigBufferSizes,
-    QueryDisplayConfig, DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME, DISPLAYCONFIG_DEVICE_INFO_HEADER,
-    DISPLAYCONFIG_DEVICE_INFO_TYPE, DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO,
-    DISPLAYCONFIG_TARGET_DEVICE_NAME, QDC_ONLY_ACTIVE_PATHS, QUERY_DISPLAY_CONFIG_FLAGS,
-};
-use windows::Win32::Foundation::{ERROR_SUCCESS, LUID};
+use windows::Win32::Devices::Display::DisplayConfigGetDeviceInfo;
+use windows::Win32::Devices::Display::DisplayConfigSetDeviceInfo;
+use windows::Win32::Devices::Display::GetDisplayConfigBufferSizes;
+use windows::Win32::Devices::Display::QueryDisplayConfig;
+use windows::Win32::Devices::Display::DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
+use windows::Win32::Devices::Display::DISPLAYCONFIG_DEVICE_INFO_HEADER;
+use windows::Win32::Devices::Display::DISPLAYCONFIG_DEVICE_INFO_TYPE;
+use windows::Win32::Devices::Display::DISPLAYCONFIG_MODE_INFO;
+use windows::Win32::Devices::Display::DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE;
+use windows::Win32::Devices::Display::DISPLAYCONFIG_PATH_INFO;
+use windows::Win32::Devices::Display::DISPLAYCONFIG_SOURCE_MODE;
+use windows::Win32::Devices::Display::DISPLAYCONFIG_TARGET_DEVICE_NAME;
+use windows::Win32::Devices::Display::QDC_ONLY_ACTIVE_PATHS;
+use windows::Win32::Devices::Display::QUERY_DISPLAY_CONFIG_FLAGS;
+use windows::Win32::Foundation::ERROR_SUCCESS;
+use windows::Win32::Foundation::LUID;
+use windows::Win32::Graphics::Gdi::DISPLAYCONFIG_PATH_MODE_IDX_INVALID;
 
 #[repr(i32)]
 #[derive(Debug, Clone, Copy)]
@@ -41,6 +52,18 @@ struct DPIScalingInfo {
     current: u32,
     recommended: u32,
     valid: bool,
+}
+
+#[allow(dead_code)]
+struct DisplayInfo {
+    adapter_id: LUID,
+    source_id: u32,
+    target_id: u32,
+    name: String,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
 }
 
 fn get_paths_and_modes(
@@ -181,8 +204,8 @@ fn set_dpi_scaling(adapter_id: LUID, source_id: u32, dpi_percent_to_set: u32) ->
     res == ERROR_SUCCESS.0 as i32
 }
 
-fn enumerate_displays() -> Vec<(LUID, u32, u32, String)> {
-    let (paths, _modes) = match get_paths_and_modes(QDC_ONLY_ACTIVE_PATHS) {
+fn enumerate_displays() -> Vec<DisplayInfo> {
+    let (paths, modes) = match get_paths_and_modes(QDC_ONLY_ACTIVE_PATHS) {
         Some(p) => p,
         None => {
             eprintln!("Cannot get display paths.");
@@ -191,7 +214,8 @@ fn enumerate_displays() -> Vec<(LUID, u32, u32, String)> {
     };
 
     let mut displays = Vec::new();
-    for (i, path) in paths.iter().enumerate() {
+
+    for path in paths.iter() {
         let mut device_name: DISPLAYCONFIG_TARGET_DEVICE_NAME = unsafe { zeroed() };
         device_name.header.size = size_of::<DISPLAYCONFIG_TARGET_DEVICE_NAME>() as u32;
         device_name.header.adapterId = path.targetInfo.adapterId;
@@ -199,16 +223,53 @@ fn enumerate_displays() -> Vec<(LUID, u32, u32, String)> {
         device_name.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
 
         let res = unsafe { DisplayConfigGetDeviceInfo(&mut device_name.header) };
-        if res == ERROR_SUCCESS.0 as i32 {
-            let name = String::from_utf16_lossy(&device_name.monitorFriendlyDeviceName);
-            let adapter_id = path.targetInfo.adapterId;
-            let source_id = path.sourceInfo.id;
-            let name = name.trim_end_matches('\u{0}').to_string();
-            displays.push((adapter_id, source_id, path.targetInfo.id, name));
-        } else {
-            eprintln!("Failed to get device info for display {}.", i + 1);
+        if res != ERROR_SUCCESS.0 as i32 {
+            continue;
         }
+
+        let mut name = String::from_utf16_lossy(&device_name.monitorFriendlyDeviceName);
+        name = name.trim_end_matches('\u{0}').to_string();
+
+        // Extract resolution and position:
+        let (x, y, width, height) = {
+            let mut px = 0;
+            let mut py = 0;
+            let mut w = 0;
+            let mut h = 0;
+            let mode_info_idx = unsafe { path.sourceInfo.Anonymous.modeInfoIdx };
+            if mode_info_idx != DISPLAYCONFIG_PATH_MODE_IDX_INVALID {
+                let mode_index = mode_info_idx as usize;
+                if mode_index < modes.len() {
+                    let mode = &modes[mode_index];
+                    if mode.infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE {
+                        let source_mode: &DISPLAYCONFIG_SOURCE_MODE =
+                            unsafe { &mode.Anonymous.sourceMode };
+                        px = source_mode.position.x;
+                        py = source_mode.position.y;
+                        w = source_mode.width;
+                        h = source_mode.height;
+                    }
+                }
+            }
+
+            (px, py, w, h)
+        };
+
+        displays.push(DisplayInfo {
+            adapter_id: path.targetInfo.adapterId,
+            source_id: path.sourceInfo.id,
+            target_id: path.targetInfo.id,
+            name,
+            x,
+            y,
+            width,
+            height,
+        });
     }
+
+    // Sort by x position (left to right)
+    displays.sort_by_key(|d| d.x);
+
     displays
 }
 
@@ -219,9 +280,17 @@ fn main() {
         return;
     }
 
-    println!("Enumerated displays:");
-    for (i, (_, _, _, name)) in displays.iter().enumerate() {
-        println!("{}: {}", i + 1, name);
+    println!("Enumerated displays (left to right):");
+    for (i, disp) in displays.iter().enumerate() {
+        println!(
+            "{}: {} ({}x{}, pos: {}x{})",
+            i + 1,
+            disp.name,
+            disp.width,
+            disp.height,
+            disp.x,
+            disp.y
+        );
     }
 
     print!("Please select a monitor by entering its number: ");
@@ -233,7 +302,7 @@ fn main() {
         .expect("Failed to read input.");
 
     let trimmed = input.trim();
-    let display_index: usize = match trimmed.parse::<usize>() {
+    let display_index= match trimmed.parse::<usize>() {
         Ok(num) if num > 0 && num <= displays.len() => num - 1,
         _ => {
             eprintln!("Invalid selection. Exiting...");
@@ -241,10 +310,13 @@ fn main() {
         }
     };
 
-    let (adapter_id, source_id, _tgt_id, disp_name) = displays[display_index].clone();
-    println!("Selected display: {} (SourceID: {})", disp_name, source_id);
+    let disp = &displays[display_index];
+    println!(
+        "Selected display: {} (SourceID: {})",
+        disp.name, disp.source_id
+    );
 
-    let dpi_info = get_dpi_scaling_info(adapter_id, source_id);
+    let dpi_info = get_dpi_scaling_info(disp.adapter_id, disp.source_id);
     if !dpi_info.valid {
         println!("Unable to fetch DPI info for the selected display");
         return;
@@ -255,10 +327,24 @@ fn main() {
     println!("Maximum DPI: {}%", dpi_info.maximum);
     println!("Possible DPIs: {:?}", DPI_VALS);
 
-    // For demonstration, let's pick 125%
-    let target_dpi = 125;
+    print!("Please select a DPI percentage from the list above: ");
+    io::stdout().flush().unwrap();
+
+    let mut dpi_input = String::new();
+    io::stdin()
+        .read_line(&mut dpi_input)
+        .expect("Failed to read input");
+    let dpi_trimmed = dpi_input.trim();
+    let target_dpi: u32 = match dpi_trimmed.parse() {
+        Ok(val) if DPI_VALS.contains(&val) => val,
+        _ => {
+            eprintln!("Invalid DPI value.");
+            return;
+        }
+    };
+
     println!("Setting DPI to {}%", target_dpi);
-    let success = set_dpi_scaling(adapter_id, source_id, target_dpi);
+    let success = set_dpi_scaling(disp.adapter_id, disp.source_id, target_dpi);
     if success {
         println!("DPI updated successfully!");
     } else {
