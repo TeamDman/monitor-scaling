@@ -1,170 +1,267 @@
-use std::ffi::OsStr;
-use std::io::Write;
-use std::io::{self};
-use std::os::windows::ffi::OsStrExt;
-use windows::core::PCWSTR;
-use windows::Win32::Foundation::*;
-use windows::Win32::Graphics::Gdi::*;
+use std::io::{self, Write};
+use std::mem::size_of;
+use std::mem::zeroed;
+use windows::Win32::Devices::Display::{
+    DisplayConfigGetDeviceInfo, DisplayConfigSetDeviceInfo, GetDisplayConfigBufferSizes,
+    QueryDisplayConfig, DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME, DISPLAYCONFIG_DEVICE_INFO_HEADER,
+    DISPLAYCONFIG_DEVICE_INFO_TYPE, DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO,
+    DISPLAYCONFIG_TARGET_DEVICE_NAME, QDC_ONLY_ACTIVE_PATHS, QUERY_DISPLAY_CONFIG_FLAGS,
+};
+use windows::Win32::Foundation::{ERROR_SUCCESS, LUID};
 
-fn main() -> windows::core::Result<()> {
-    println!("Listing monitors and their current scaling resolutions:\n");
+#[repr(i32)]
+#[derive(Debug, Clone, Copy)]
+#[allow(non_camel_case_types)]
+enum DISPLAYCONFIG_DEVICE_INFO_TYPE_CUSTOM {
+    DISPLAYCONFIG_DEVICE_INFO_GET_DPI_SCALE = -3, // get DPI info
+    DISPLAYCONFIG_DEVICE_INFO_SET_DPI_SCALE = -4, // set DPI
+}
 
-    let mut monitor_data: Vec<MonitorInfo> = Vec::new();
+#[repr(C)]
+#[allow(non_camel_case_types, non_snake_case)]
+struct DISPLAYCONFIG_SOURCE_DPI_SCALE_GET {
+    header: DISPLAYCONFIG_DEVICE_INFO_HEADER,
+    minScaleRel: i32,
+    curScaleRel: i32,
+    maxScaleRel: i32,
+}
+
+#[repr(C)]
+#[allow(non_camel_case_types, non_snake_case)]
+struct DISPLAYCONFIG_SOURCE_DPI_SCALE_SET {
+    header: DISPLAYCONFIG_DEVICE_INFO_HEADER,
+    scaleRel: i32,
+}
+
+static DPI_VALS: [u32; 12] = [100, 125, 150, 175, 200, 225, 250, 300, 350, 400, 450, 500];
+
+struct DPIScalingInfo {
+    minimum: u32,
+    maximum: u32,
+    current: u32,
+    recommended: u32,
+    valid: bool,
+}
+
+fn get_paths_and_modes(
+    flags: QUERY_DISPLAY_CONFIG_FLAGS,
+) -> Option<(Vec<DISPLAYCONFIG_PATH_INFO>, Vec<DISPLAYCONFIG_MODE_INFO>)> {
+    let mut num_paths: u32 = 0;
+    let mut num_modes: u32 = 0;
+
+    let status = unsafe { GetDisplayConfigBufferSizes(flags, &mut num_paths, &mut num_modes) };
+    if status != ERROR_SUCCESS {
+        return None;
+    }
+
+    let mut paths = Vec::with_capacity(num_paths as usize);
+    let mut modes = Vec::with_capacity(num_modes as usize);
+
+    let status = unsafe {
+        QueryDisplayConfig(
+            flags,
+            &mut num_paths,
+            paths.as_mut_ptr(),
+            &mut num_modes,
+            modes.as_mut_ptr(),
+            None,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return None;
+    }
 
     unsafe {
-        EnumDisplayMonitors(
-            None,
-            None,
-            Some(monitor_enum_proc),
-            LPARAM(&mut monitor_data as *mut _ as isize),
-        ).ok()?;
+        paths.set_len(num_paths as usize);
+        modes.set_len(num_modes as usize);
     }
 
-    if monitor_data.is_empty() {
-        println!("No monitors found.");
-        return Ok(());
-    }
+    Some((paths, modes))
+}
 
-    // Display the monitors
-    for (i, monitor) in monitor_data.iter().enumerate() {
-        println!("{}: {}", i + 1, monitor.description);
-    }
-
-    let monitor_index = prompt_for_choice(monitor_data.len())? - 1;
-    let selected_monitor = &monitor_data[monitor_index];
-    println!("\nYou selected: {}\n", selected_monitor.description);
-
-    let resolutions = get_supported_resolutions(&selected_monitor.device_name)?;
-    for (i, resolution) in resolutions.iter().enumerate() {
-        println!("{}: {}x{}", i + 1, resolution.width, resolution.height);
-    }
-
-    let res_index = prompt_for_choice(resolutions.len())? - 1;
-    let selected_res = &resolutions[res_index];
-    println!(
-        "\nSetting resolution to {}x{}...\n",
-        selected_res.width, selected_res.height
+fn get_dpi_scaling_info(adapter_id: LUID, source_id: u32) -> DPIScalingInfo {
+    let mut request_packet: DISPLAYCONFIG_SOURCE_DPI_SCALE_GET = unsafe { zeroed() };
+    request_packet.header.size = size_of::<DISPLAYCONFIG_SOURCE_DPI_SCALE_GET>() as u32;
+    request_packet.header.adapterId = adapter_id;
+    request_packet.header.id = source_id;
+    request_packet.header.r#type = DISPLAYCONFIG_DEVICE_INFO_TYPE(
+        DISPLAYCONFIG_DEVICE_INFO_TYPE_CUSTOM::DISPLAYCONFIG_DEVICE_INFO_GET_DPI_SCALE as i32,
     );
 
-    set_monitor_resolution(
-        &selected_monitor.device_name,
-        selected_res.width,
-        selected_res.height,
-    )?;
-
-    println!("Resolution changed successfully!");
-    Ok(())
-}
-
-struct MonitorInfo {
-    description: String,
-    device_name: String,
-}
-
-struct Resolution {
-    width: u32,
-    height: u32,
-}
-
-unsafe extern "system" fn monitor_enum_proc(
-    monitor: HMONITOR,
-    _: HDC,
-    _: *mut RECT,
-    lparam: LPARAM,
-) -> BOOL {
-    let monitor_data = &mut *(lparam.0 as *mut Vec<MonitorInfo>);
-    let mut monitor_info = MONITORINFOEXW::default();
-    monitor_info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
-
-    if GetMonitorInfoW(monitor, &mut monitor_info as *mut _ as *mut MONITORINFO).as_bool() {
-        let device_name = widestring_to_string(&monitor_info.szDevice);
-        let rect = monitor_info.monitorInfo.rcMonitor;
-        let description = format!(
-            "{}: {}x{}",
-            device_name,
-            rect.right - rect.left,
-            rect.bottom - rect.top
-        );
-        monitor_data.push(MonitorInfo {
-            description,
-            device_name,
-        });
+    let res = unsafe { DisplayConfigGetDeviceInfo(&mut request_packet.header) };
+    if res != ERROR_SUCCESS.0 as i32 {
+        return DPIScalingInfo {
+            minimum: 100,
+            maximum: 100,
+            current: 100,
+            recommended: 100,
+            valid: false,
+        };
     }
-    true.into()
+
+    let mut cur_scale = request_packet.curScaleRel;
+    if cur_scale < request_packet.minScaleRel {
+        cur_scale = request_packet.minScaleRel;
+    } else if cur_scale > request_packet.maxScaleRel {
+        cur_scale = request_packet.maxScaleRel;
+    }
+
+    let min_abs = request_packet.minScaleRel.abs() as usize;
+    let total_count = DPI_VALS.len();
+    let max_index = min_abs + (request_packet.maxScaleRel as usize);
+    if max_index >= total_count {
+        return DPIScalingInfo {
+            minimum: 100,
+            maximum: 100,
+            current: 100,
+            recommended: 100,
+            valid: false,
+        };
+    }
+
+    let current = DPI_VALS[min_abs + (cur_scale as usize)];
+    let recommended = DPI_VALS[min_abs];
+    let maximum = DPI_VALS[min_abs + (request_packet.maxScaleRel as usize)];
+
+    DPIScalingInfo {
+        minimum: 100,
+        maximum,
+        current,
+        recommended,
+        valid: true,
+    }
 }
 
-fn get_supported_resolutions(device_name: &str) -> windows::core::Result<Vec<Resolution>> {
-    let mut resolutions = Vec::new();
-    unsafe {
-        let mut dm = DEVMODEW::default();
-        dm.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
+fn set_dpi_scaling(adapter_id: LUID, source_id: u32, dpi_percent_to_set: u32) -> bool {
+    let dpi_info = get_dpi_scaling_info(adapter_id, source_id);
+    if !dpi_info.valid {
+        eprintln!("Unable to get DPI info for this display.");
+        return false;
+    }
 
-        let mut mode_num = 0;
-        let dev_name = string_to_pcwstr(device_name);
+    let mut dpi = dpi_percent_to_set;
+    if dpi == dpi_info.current {
+        return true;
+    }
+    if dpi < dpi_info.minimum {
+        dpi = dpi_info.minimum;
+    } else if dpi > dpi_info.maximum {
+        dpi = dpi_info.maximum;
+    }
 
-        while EnumDisplaySettingsW(dev_name, ENUM_DISPLAY_SETTINGS_MODE(mode_num), &mut dm)
-            .as_bool()
-        {
-            resolutions.push(Resolution {
-                width: dm.dmPelsWidth,
-                height: dm.dmPelsHeight,
-            });
-            mode_num += 1;
+    let mut idx_recommended = -1;
+    let mut idx_to_set = -1;
+
+    for (i, val) in DPI_VALS.iter().enumerate() {
+        if *val == dpi {
+            idx_to_set = i as i32;
+        }
+        if *val == dpi_info.recommended {
+            idx_recommended = i as i32;
         }
     }
-    Ok(resolutions)
+
+    if idx_recommended == -1 || idx_to_set == -1 {
+        eprintln!("Error: cannot find DPI value indexes.");
+        return false;
+    }
+
+    let dpi_relative_val = idx_to_set - idx_recommended;
+
+    let mut set_packet: DISPLAYCONFIG_SOURCE_DPI_SCALE_SET = unsafe { zeroed() };
+    set_packet.header.adapterId = adapter_id;
+    set_packet.header.id = source_id;
+    set_packet.header.size = size_of::<DISPLAYCONFIG_SOURCE_DPI_SCALE_SET>() as u32;
+    set_packet.header.r#type = DISPLAYCONFIG_DEVICE_INFO_TYPE(
+        DISPLAYCONFIG_DEVICE_INFO_TYPE_CUSTOM::DISPLAYCONFIG_DEVICE_INFO_SET_DPI_SCALE as i32,
+    );
+    set_packet.scaleRel = dpi_relative_val;
+
+    let res = unsafe { DisplayConfigSetDeviceInfo(&set_packet.header) };
+    res == ERROR_SUCCESS.0 as i32
 }
 
-fn set_monitor_resolution(device_name: &str, width: u32, height: u32) -> windows::core::Result<()> {
-    unsafe {
-        let mut dm = DEVMODEW::default();
-        dm.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
-        dm.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT;
-        dm.dmPelsWidth = width;
-        dm.dmPelsHeight = height;
+fn enumerate_displays() -> Vec<(LUID, u32, u32, String)> {
+    let (paths, _modes) = match get_paths_and_modes(QDC_ONLY_ACTIVE_PATHS) {
+        Some(p) => p,
+        None => {
+            eprintln!("Cannot get display paths.");
+            return vec![];
+        }
+    };
 
-        let dev_name = string_to_pcwstr(device_name);
+    let mut displays = Vec::new();
+    for (i, path) in paths.iter().enumerate() {
+        let mut device_name: DISPLAYCONFIG_TARGET_DEVICE_NAME = unsafe { zeroed() };
+        device_name.header.size = size_of::<DISPLAYCONFIG_TARGET_DEVICE_NAME>() as u32;
+        device_name.header.adapterId = path.targetInfo.adapterId;
+        device_name.header.id = path.targetInfo.id;
+        device_name.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
 
-        let result = ChangeDisplaySettingsExW(
-            dev_name,
-            Some(&dm),
-            HWND(std::ptr::null_mut()),
-            CDS_UPDATEREGISTRY,
-            None,
-        );
-
-        if result == DISP_CHANGE_SUCCESSFUL {
-            Ok(())
+        let res = unsafe { DisplayConfigGetDeviceInfo(&mut device_name.header) };
+        if res == ERROR_SUCCESS.0 as i32 {
+            let name = String::from_utf16_lossy(&device_name.monitorFriendlyDeviceName);
+            let adapter_id = path.targetInfo.adapterId;
+            let source_id = path.sourceInfo.id;
+            let name = name.trim_end_matches('\u{0}').to_string();
+            displays.push((adapter_id, source_id, path.targetInfo.id, name));
         } else {
-            Err(windows::core::Error::from_win32())
+            eprintln!("Failed to get device info for display {}.", i + 1);
         }
     }
+    displays
 }
 
-fn prompt_for_choice(max: usize) -> io::Result<usize> {
+fn main() {
+    let displays = enumerate_displays();
+    if displays.is_empty() {
+        eprintln!("No active displays found.");
+        return;
+    }
+
+    println!("Enumerated displays:");
+    for (i, (_, _, _, name)) in displays.iter().enumerate() {
+        println!("{}: {}", i + 1, name);
+    }
+
+    print!("Please select a monitor by entering its number: ");
+    io::stdout().flush().unwrap();
+
     let mut input = String::new();
-    loop {
-        print!("Enter a number (1-{}): ", max);
-        io::stdout().flush()?;
-        input.clear();
-        io::stdin().read_line(&mut input)?;
-        if let Ok(choice) = input.trim().parse::<usize>() {
-            if choice > 0 && choice <= max {
-                return Ok(choice);
-            }
+    io::stdin()
+        .read_line(&mut input)
+        .expect("Failed to read input.");
+
+    let trimmed = input.trim();
+    let display_index: usize = match trimmed.parse::<usize>() {
+        Ok(num) if num > 0 && num <= displays.len() => num - 1,
+        _ => {
+            eprintln!("Invalid selection. Exiting...");
+            return;
         }
-        println!("Invalid choice. Try again.");
+    };
+
+    let (adapter_id, source_id, _tgt_id, disp_name) = displays[display_index].clone();
+    println!("Selected display: {} (SourceID: {})", disp_name, source_id);
+
+    let dpi_info = get_dpi_scaling_info(adapter_id, source_id);
+    if !dpi_info.valid {
+        println!("Unable to fetch DPI info for the selected display");
+        return;
     }
-}
 
-fn widestring_to_string(wstr: &[u16]) -> String {
-    String::from_utf16_lossy(&wstr[..wstr.iter().position(|&c| c == 0).unwrap_or(wstr.len())])
-}
+    println!("Current DPI: {}%", dpi_info.current);
+    println!("Recommended DPI: {}%", dpi_info.recommended);
+    println!("Maximum DPI: {}%", dpi_info.maximum);
+    println!("Possible DPIs: {:?}", DPI_VALS);
 
-fn string_to_pcwstr(s: &str) -> PCWSTR {
-    let utf16: Vec<u16> = OsStr::new(s)
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-    PCWSTR(utf16.as_ptr())
+    // For demonstration, let's pick 125%
+    let target_dpi = 125;
+    println!("Setting DPI to {}%", target_dpi);
+    let success = set_dpi_scaling(adapter_id, source_id, target_dpi);
+    if success {
+        println!("DPI updated successfully!");
+    } else {
+        println!("Failed to update DPI");
+    }
 }

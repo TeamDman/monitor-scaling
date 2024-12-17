@@ -159,3 +159,11 @@ if ($requiredFeatures.Count -gt 0) {
 else {
     Write-Warning "No required features identified."
 }
+
+
+# todo:
+# use windows::Win32::Graphics::Gdi::DisplayConfigGetDeviceInfo;
+# should have been
+# use windows::Win32::Devices::Display::DisplayConfigGetDeviceInfo;
+# the LLM hallucinated
+# we should be able to find the correct namespace by looking at the json
