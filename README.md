@@ -1,5 +1,9 @@
 # Monitor DPI Scaling Tool
 
+
+https://github.com/user-attachments/assets/fdaaa1b4-6391-463a-bf49-c9f86f294b7c
+
+
 This repository contains a Rust-based command-line tool for enumerating connected monitors, displaying their resolution and position, and allowing the user to change their DPI scaling settings programmatically. It demonstrates how to leverage undocumented or reverse-engineered Windows APIs to set per-monitor display scaling percentages, mimicking the behavior of the Windows "Display settings" UI.
 
 ![](./media/scale_and_layout_200.png)
